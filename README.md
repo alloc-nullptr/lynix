@@ -1,4 +1,4 @@
-# lynix
+# lynix NOT WORKING Right NOW
 Make Lynx executor works on linux 
 
 1.download lynix-proton.sh
