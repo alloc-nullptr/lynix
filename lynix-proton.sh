@@ -27,8 +27,20 @@ set -Eeuo pipefail
 
 APP_NAME="Lynix Proton Wrapper"
 APP_ID="lynix-proton"
-SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
-SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
+
+# BASH_SOURCE is empty when the script is piped to bash, for example:
+#   curl -fsSL <url-to-this-script> | bash
+# In that case there is no on-disk script path; prompts use /dev/tty below.
+SELF_SOURCE="${BASH_SOURCE[0]:-}"
+if [ -n "$SELF_SOURCE" ] && [ -f "$SELF_SOURCE" ]; then
+  SCRIPT_PATH="$(readlink -f -- "$SELF_SOURCE")"
+  SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
+else
+  SCRIPT_PATH=""
+  SCRIPT_DIR="$PWD"
+fi
+PROG_NAME="${SELF_SOURCE##*/}"
+[ -n "$PROG_NAME" ] || PROG_NAME="lynix-proton.sh"
 
 DATA_DIR="${LYNIX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/$APP_ID}"
 CONFIG_DIR="${LYNIX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/$APP_ID}"
@@ -65,7 +77,8 @@ A standalone launcher for a user-supplied UI.exe (Lynx), running it through
 GE-Proton or GDK-Proton.  UI.exe is not included with this script.
 
 Usage:
-  $(basename -- "$0") [options] [-- UI.exe arguments...]
+  $PROG_NAME [options] [-- UI.exe arguments...]
+  curl -fsSL <url-to-this-script> | bash -s -- [options]
 
 Options:
   -h, --help                 Show this help and exit
@@ -90,8 +103,12 @@ Environment:
   LYNIX_CONFIG_DIR           Override settings folder
                              (default: \$XDG_CONFIG_HOME/lynix-proton)
   LYNIX_PROTON               Use this Proton folder without saving it
+  LYNIX_SCRIPT_URL           URL of this script; lets --install-desktop save
+                             a copy when the script was run from a pipe
 
 Notes:
+  * The script can be piped directly from curl.  Prompts are read from the
+    controlling terminal, so stdin remains the script itself.
   * UI.exe is licensed software and is deliberately not bundled here.
   * No Steam installation is required.  Steam Proton installs are used when
     found, otherwise a private GDK-Proton/GE-Proton build is downloaded.
@@ -106,6 +123,27 @@ EOF
 say()  { printf '%s\n' "$*"; }
 log()  { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+TTY_FD=""
+
+init_tty() {
+  # When bash reads the script from a pipe, fd 0 is the script, not the user.
+  # Prompt through /dev/tty so a "curl -fsSL ... | bash" run stays interactive.
+  TTY_FD=""
+  if [ -r /dev/tty ] && { true </dev/tty; } 2>/dev/null; then
+    TTY_FD="/dev/tty"
+  elif [ -t 0 ]; then
+    TTY_FD="/dev/stdin"
+  fi
+}
+
+read_tty() {
+  local __var="$1" __line=""
+  [ -n "$TTY_FD" ] || return 1
+  IFS= read -r __line <"$TTY_FD" || __line=""
+  printf -v "$__var" '%s' "$__line"
+  return 0
+}
 
 gui_init() {
   [ "$NO_GUI" -eq 0 ] || return 0
@@ -143,11 +181,20 @@ gui_error() {
 
 gui_yesno() {
   local text="${1//\\n/$'\n'}"
+  local answer=""
   case "$GUI" in
     zenity) zenity --question --title="$APP_NAME" --text="$text" --width=460 ;;
     kdialog) kdialog --title "$APP_NAME" --yesno "$text" ;;
     yad) yad --question --title="$APP_NAME" --text="$text" --width=460 ;;
-    *) return 1 ;;
+    *)
+      [ -n "$TTY_FD" ] || return 1
+      printf '%s\nContinue? [y/N] ' "$text" >&2
+      read_tty answer || answer=""
+      case "$answer" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
   esac
 }
 
@@ -216,8 +263,11 @@ gui_progress_stop() {
 die() {
   local msg="$1"
   log "ERROR: $msg"
-  gui_error "$msg"
-  printf 'ERROR: %s\n' "$msg" >&2
+  if [ -n "$GUI" ]; then
+    gui_error "$msg"
+  else
+    printf 'ERROR: %s\n' "${msg//\\n/$'\n'}" >&2
+  fi
   exit 1
 }
 
@@ -391,7 +441,7 @@ select_exe() {
       chosen="$(gui_pick_file "$start" 2>/dev/null || true)"
     else
       printf 'Select the UI.exe file (drag it here or type its path):\n> ' >&2
-      IFS= read -r chosen || chosen=""
+      read_tty chosen || die "No terminal is available to ask for UI.exe.\nRun again with --exe /path/to/UI.exe."
     fi
 
     [ -n "$chosen" ] || die "No UI.exe was selected."
@@ -434,7 +484,7 @@ choose_proton_dir() {
     chosen="$(gui_pick_dir "$HOME" 2>/dev/null || true)"
   else
     printf 'Path to a Proton folder (containing the "proton" executable):\n> ' >&2
-    IFS= read -r chosen || chosen=""
+    read_tty chosen || die "No terminal is available to ask for a Proton folder.\nRun again with --proton /path/to/Proton."
   fi
   [ -n "$chosen" ] || die "No Proton folder was selected."
   chosen="$(readlink -f -- "$chosen")"
@@ -460,13 +510,16 @@ download_file() {
   mkdir -p "$(dirname -- "$dest")"
   rm -f "$part"
   log "Downloading $label from $url"
+  if [ -z "$GUI" ]; then
+    printf 'Downloading %s...\n' "$label" >&2
+  fi
   gui_progress_start "Downloading $label...\nThis can take a few minutes."
 
   if have curl; then
     if [ "$GUI" != "" ]; then
       curl -fsSL --retry 3 --connect-timeout 30 -o "$part" "$url" >>"$LOG_FILE" 2>&1 || rc=$?
     else
-      curl -fL --retry 3 --connect-timeout 30 --progress-bar -o "$part" "$url" || rc=$?
+      curl -fsSL --retry 3 --connect-timeout 30 -o "$part" "$url" || rc=$?
     fi
   elif have wget; then
     wget -O "$part" "$url" >>"$LOG_FILE" 2>&1 || rc=$?
@@ -632,19 +685,19 @@ ensure_proton() {
     return 0
   fi
 
-  if [ ! -t 0 ]; then
-    die "No Proton build was found and no terminal is available to ask.\nInstall Proton in a standard location or run:\n  $SCRIPT_PATH --proton /path/to/Proton"
+  if [ -z "$TTY_FD" ]; then
+    die "No Proton build was found and no terminal is available to ask.\nInstall Proton in a standard location or run:\n  $PROG_NAME --proton /path/to/Proton"
   fi
 
   printf 'No Proton build was found.\n' >&2
   printf 'Download GDK-Proton (~500 MB)? [Y/n] ' >&2
   local answer=""
-  IFS= read -r answer || answer=""
+  read_tty answer || answer=""
   case "${answer:-y}" in
     y|Y|yes|YES|'') download_proton gdk; return 0 ;;
   esac
   printf 'Download GE-Proton instead (~540 MB)? [Y/n] ' >&2
-  IFS= read -r answer || answer=""
+  read_tty answer || answer=""
   case "${answer:-y}" in
     y|Y|yes|YES|'') download_proton ge; return 0 ;;
   esac
@@ -677,7 +730,7 @@ run_installer() {
   name="$(basename -- "$exe")"
   log "Running installer: $exe $*"
   proton_env
-  ( cd "$dir" && "$PROTON_DIR/proton" run "$name" "$@" ) >>"$LOG_FILE" 2>&1
+  ( cd "$dir" && "$PROTON_DIR/proton" run "$name" "$@" ) </dev/null >>"$LOG_FILE" 2>&1
 }
 
 vc_runtime_version() {
@@ -787,10 +840,10 @@ set_webview2_policy() {
   proton_env
   "$PROTON_DIR/proton" runinprefix "C:\\windows\\system32\\reg.exe" add \
     "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments" \
-    /v "*" /t REG_SZ /d "--disable-gpu" /f >>"$LOG_FILE" 2>&1 || true
+    /v "*" /t REG_SZ /d "--disable-gpu" /f </dev/null >>"$LOG_FILE" 2>&1 || true
   "$PROTON_DIR/proton" runinprefix "C:\\windows\\system32\\reg.exe" add \
     "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments" \
-    /v "UI.exe" /t REG_SZ /d "--disable-gpu" /f >>"$LOG_FILE" 2>&1 || true
+    /v "UI.exe" /t REG_SZ /d "--disable-gpu" /f </dev/null >>"$LOG_FILE" 2>&1 || true
 }
 
 ensure_runtimes() {
@@ -823,8 +876,32 @@ show_status() {
   printf '  Settings: %s\n' "$CONFIG_FILE"
 }
 
+resolve_script_copy() {
+  # A desktop entry needs a persistent path.  Normal runs already have one;
+  # "curl -fsSL ... | bash" runs do not, so optionally fetch and keep a copy.
+  if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
+    printf '%s' "$SCRIPT_PATH"
+    return 0
+  fi
+  local copy="$DATA_DIR/$APP_ID.sh"
+  if [ -f "$copy" ]; then
+    printf '%s' "$copy"
+    return 0
+  fi
+  if [ -n "${LYNIX_SCRIPT_URL:-}" ]; then
+    download_file "$LYNIX_SCRIPT_URL" "$copy" "$PROG_NAME" 1024
+    chmod +x "$copy" 2>/dev/null || true
+    printf '%s' "$copy"
+    return 0
+  fi
+  return 1
+}
+
 install_desktop_entry() {
-  local appdir
+  local self appdir
+  if ! self="$(resolve_script_copy)"; then
+    die "The application-menu shortcut needs a saved copy of this script.\n\nSave lynix-proton.sh to a file and run:\n  ./lynix-proton.sh --install-desktop\n\nWhen using curl, set LYNIX_SCRIPT_URL to the script URL."
+  fi
   appdir="$(dirname -- "$DESKTOP_FILE")"
   mkdir -p "$appdir"
   cat >"$DESKTOP_FILE" <<EOF
@@ -833,7 +910,7 @@ Type=Application
 Version=1.0
 Name=Lynx (Proton)
 Comment=Run a user-supplied UI.exe through GE-Proton or GDK-Proton
-Exec="$SCRIPT_PATH"
+Exec="$self"
 Icon=wine
 Terminal=false
 Categories=Development;Utility;
@@ -850,17 +927,23 @@ EOF
 }
 
 uninstall_wrapper() {
+  local purged=0
   rm -f "$DESKTOP_FILE"
   rm -f "$CONFIG_FILE"
   if [ "$PURGE" -eq 1 ]; then
     if gui_yesno "Delete the private Proton prefix, downloaded Proton builds and cached installers?\n\nThis does NOT touch UI.exe or any Steam installation.\n\nFolder: $DATA_DIR"; then
       rm -rf "$DATA_DIR"
+      purged=1
     fi
   fi
-  gui_info "Removed the shortcut and wrapper settings.${PURGE:+ }"
+  gui_info "Removed the shortcut and wrapper settings."
   printf 'Removed %s\n' "$DESKTOP_FILE"
   printf 'Removed %s\n' "$CONFIG_FILE"
-  printf 'Wrapper data kept at %s\n' "$DATA_DIR"
+  if [ "$purged" -eq 1 ]; then
+    printf 'Removed private data at %s\n' "$DATA_DIR"
+  else
+    printf 'Wrapper data kept at %s\n' "$DATA_DIR"
+  fi
 }
 
 app_is_running() {
@@ -924,7 +1007,7 @@ launch_app() {
   # Proton launches through its internal steam.exe shim.  It must receive a
   # name relative to the working directory, not an absolute Unix path, or the
   # app may start in a broken state and exit shortly afterwards.
-  ( cd "$exe_dir" && "$PROTON_DIR/proton" run "$exe_name" "${PASSTHRU[@]}" ) >>"$LOG_FILE" 2>&1
+  ( cd "$exe_dir" && "$PROTON_DIR/proton" run "$exe_name" "${PASSTHRU[@]}" ) </dev/null >>"$LOG_FILE" 2>&1
   rc=$?
   set -e
 
@@ -941,6 +1024,7 @@ launch_app() {
 main() {
   parse_args "$@"
   gui_init
+  init_tty
 
   if [ "$UNINSTALL" -eq 1 ]; then
     uninstall_wrapper
@@ -965,8 +1049,14 @@ main() {
   ensure_runtimes
 
   if [ "$NO_LAUNCH" -eq 1 ]; then
+    local launch_hint
+    if [ -n "$SCRIPT_PATH" ]; then
+      launch_hint="$SCRIPT_PATH"
+    else
+      launch_hint="curl -fsSL <script-url> | bash"
+    fi
     show_status
-    gui_info "Setup is complete.\n\nUI.exe:\n$EXE_PATH\n\nProton:\n$(proton_version "$PROTON_DIR")\n\nYou can now launch Lynx with:\n$SCRIPT_PATH"
+    gui_info "Setup is complete.\n\nUI.exe:\n$EXE_PATH\n\nProton:\n$(proton_version "$PROTON_DIR")\n\nYou can now launch Lynx with:\n$launch_hint"
     return 0
   fi
 
